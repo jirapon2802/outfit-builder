@@ -14,7 +14,7 @@ async function sourceModule(file) {
 }
 const { generationBlock, restoreSelection } = await sourceModule('../src/lib/outfit.ts');
 const { removePlainBackground } = await sourceModule('../src/lib/images.ts');
-const { runFastFit, readResult, providerFailure } = await sourceModule('../src/lib/fastfit.ts');
+const { runFastFit, runQwenEdit, readResult, providerFailure } = await sourceModule('../src/lib/providers.ts');
 const complete = { top: 't', bottom: 'b', shoes: 's' };
 
 test('generation requires all three pieces; outerwear, quota, availability, and busy state block it', () => {
@@ -28,23 +28,25 @@ test('generation requires all three pieces; outerwear, quota, availability, and 
 
 test('API validates pieces and outerwear before inference, and handles success and quota', async () => {
   const require = createRequire(import.meta.url);
-  const providerSource = await readFile(new URL('../src/lib/fastfit.ts', import.meta.url), 'utf8');
+  const providerSource = await readFile(new URL('../src/lib/providers.ts', import.meta.url), 'utf8');
   const providerJS = ts.transpileModule(providerSource, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText;
   const providerURL = `data:text/javascript;base64,${Buffer.from(providerJS).toString('base64')}`;
   const routeSource = (await readFile(new URL('../src/app/api/try-on/route.ts', import.meta.url), 'utf8'))
-    .replace('"@/lib/fastfit"', JSON.stringify(providerURL))
+    .replace('"@/lib/providers"', JSON.stringify(providerURL))
     .replace('"next/server"', JSON.stringify(pathToFileURL(require.resolve('next/server')).href));
   const routeJS = ts.transpileModule(routeSource, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText;
   const { GET, POST } = await import(`data:text/javascript;base64,${Buffer.from(routeJS).toString('base64')}`);
-  const previous = process.env.FASTFIT_URL;
-  delete process.env.FASTFIT_URL;
+  const previous = { FASTFIT_URL: process.env.FASTFIT_URL, HF_TOKEN: process.env.HF_TOKEN, IMAGE_EDIT_URL: process.env.IMAGE_EDIT_URL };
+  delete process.env.FASTFIT_URL; delete process.env.HF_TOKEN;
+  // Point at a closed port so the check never reaches the public Space.
+  process.env.IMAGE_EDIT_URL = 'http://127.0.0.1:1';
   assert.equal((await (await GET()).json()).available, false);
   let queued = 0, quota = false, origin;
   const fixture = await readFile(new URL('./fixtures/top.png', import.meta.url));
   const server = createServer(async (request, response) => {
     for await (const chunk of request) void chunk;
     response.setHeader('content-type', 'application/json');
-    if (request.url === '/config') response.end('{"dependencies":[{"api_name":"try_on"}]}');
+    if (request.url === '/gradio_api/info') response.end('{"named_endpoints":{"/try_on":{}}}');
     else if (request.url === '/gradio_api/upload') response.end('["a","b","c","d"]');
     else if (request.url === '/gradio_api/call/try_on') { queued++; response.end('{"event_id":"outfit"}'); }
     else if (request.url === '/gradio_api/call/try_on/outfit') {
@@ -74,7 +76,9 @@ test('API validates pieces and outerwear before inference, and handles success a
     const limited = await POST(makeRequest()); assert.equal(limited.status, 429); assert.equal((await limited.json()).retryAfter, 600);
     assert.equal((await POST(makeRequest())).status, 429); assert.equal(queued, 2, 'cooldown must avoid another inference request');
   } finally {
-    if (previous === undefined) delete process.env.FASTFIT_URL; else process.env.FASTFIT_URL = previous;
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
   }
 });
@@ -109,6 +113,33 @@ test('SSE parser handles fragmented events, heartbeats, quota failures and unfin
   assert.deepEqual(await readResult(new Response(stream)), [{ url: 'ok' }]);
   await assert.rejects(readResult(new Response('event: error\ndata: "GPU quota exceeded"\n\n')), e => e.status === 429);
   await assert.rejects(readResult(new Response('event: heartbeat\ndata: null\n\n')), /ended before/);
+  await assert.rejects(readResult(new Response('event: error\ndata: null\n\n')), e => e.status === 429 && /allowance is used up, or the access token/.test(e.message));
+});
+test('Qwen adapter sends the gallery payload with the token and never enables prompt rewriting', async () => {
+  let payload, authorization, origin;
+  const server = createServer(async (request, response) => {
+    const chunks = []; for await (const chunk of request) chunks.push(chunk);
+    if (request.url === '/gradio_api/upload') {
+      response.setHeader('content-type', 'application/json'); response.end('["m","t","b","s"]');
+    } else if (request.url === '/gradio_api/call/infer') {
+      authorization = request.headers.authorization; payload = JSON.parse(Buffer.concat(chunks).toString()).data;
+      response.setHeader('content-type', 'application/json'); response.end('{"event_id":"job"}');
+    } else if (request.url === '/gradio_api/call/infer/job') {
+      response.setHeader('content-type', 'text/event-stream');
+      response.end(`event: complete\ndata: ${JSON.stringify([[{ image: { path: '/tmp/gradio/out.webp' } }], 42])}\n\n`);
+    } else { response.setHeader('content-type', 'image/webp'); response.end(Buffer.from([82, 73, 70, 70])); }
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  origin = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const images = Array.from({ length: 4 }, () => new Blob(['test'], { type: 'image/webp' }));
+    const image = await runQwenEdit(origin, images, 'hf_test', AbortSignal.timeout(5000));
+    assert.equal(image.type, 'image/webp');
+    assert.equal(authorization, 'Bearer hf_test');
+    assert.deepEqual(payload[0].map(item => item.image.path), ['m', 't', 'b', 's']);
+    assert.match(payload[1], /picture 1/i);
+    assert.deepEqual(payload.slice(-3), [256, 256, false], 'auto-size sentinel, and prompt rewriting stays off');
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 });
 test('Gradio adapter uploads four images, queues once and retrieves only a same-origin result', async () => {
   let mode = 'success', calls = 0, origin;

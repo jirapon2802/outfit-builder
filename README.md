@@ -24,24 +24,47 @@ Open http://localhost:3000 on your computer. On a phone connected to the same Wi
 
 Clearing browser data erases this local wardrobe; there is no account, sync, cloud backup, or preview gallery. The app itself needs the web server; offline installation/service-worker support is not included.
 
-## AI status: integration implemented; live generation not yet validated
+## AI status: two free routes wired up; the model has been shown to do the job
 
-The wardrobe and collage run without configuration. AI remains visibly unavailable until a compatible endpoint is connected.
+The wardrobe and collage run without configuration. Neither AI route uses a paid provider.
 
-On 2026-09-21, the official FastFit demo timed out, one public Hugging Face copy reported a runtime error, and another was sleeping on CPU hardware. As an alternative, the official Qwen/Qwen-Image-Edit Space accepted a synthetic reference-board upload and queued a free API request, but returned `event: error, data: null` without an image. No successful free inference route was verified. The automated adapter tests use a local simulated Gradio service; they do not establish generated-image quality or GPU compatibility.
+### Option 1: shared Qwen-Image-Edit Space (no GPU of your own, no setup)
 
-The service contract is implemented by `ai-space/outfit_api.py`: a Gradio 5+ `/try_on` endpoint accepting four images (reference person, top, bottom, shoes) and returning one PNG. It wraps the official FastFit engine. The website uses Gradio's upload/call/SSE HTTP flow with native fetch, request size limits, timeout, same-origin checks, a single in-flight request per Node process, and quota cooldown. No API key or paid provider is required or configured.
+Qwen-Image-Edit-2511 Spaces publish a free Gradio `/infer` endpoint that edits a set of uploaded images from a text instruction. The app sends four images (bundled reference model, top, bottom, shoes) and an outfit instruction, so garment photos are uploaded directly and never need to be publicly hosted. This route is on by default; no configuration is required.
 
-To connect a working endpoint:
+Setting `HF_TOKEN` in `.env.local` to a free Hugging Face read token is strongly recommended. Without it, requests draw on a small per-IP ZeroGPU allowance that is frequently already spent. Override the Space with `IMAGE_EDIT_URL` if you prefer a different one with the same `/infer` signature.
+
+Verified on 2026-09-21 by driving live Spaces with real garment photos:
+
+- The model does the job. Given a full-body photo plus a black t-shirt, a pair of distressed blue jeans, and white sneakers, it produced a photorealistic full-body image wearing all three, preserving the person's face, hair, tattoos and pose, and reproducing the shirt's chest logo and the jeans' distressing. That run took roughly 85 seconds on a 4-step Space.
+- **Choice of Space matters more than the model.** ZeroGPU compares the *requested* `@spaces.GPU(duration=...)` against remaining quota, not the actual runtime. The official `Qwen/Qwen-Image-Edit-2511` Space requests 180 seconds and is therefore refused outright on a free allowance, about 300 ms after queueing, with `event: error, data: null` — the same symptom recorded here earlier, and it happens in that Space's own web UI too, not just over the API. The default Space configured here asks for the 60-second default and fits.
+- The free allowance is small and per-IP. Two successful anonymous generations exhausted it; subsequent calls failed in about one second.
+
+What is still unverified: no run has gone through this project's own `/api/try-on` route end to end, because the development environment had no working shell to start Next.js. The adapter sends a payload shape that the live Space accepts (upload and queue both return 200), but latency and output through the app's own bundled model images are unmeasured.
+
+### Option 2: your own FastFit endpoint
+
+`ai-space/outfit_api.py` implements a Gradio 5+ `/try_on` endpoint accepting four images (reference person, top, bottom, shoes) and returning one PNG, wrapping the official FastFit engine. `FASTFIT_URL` takes precedence over `HF_TOKEN` when both are set.
 
 1. In a separate environment, clone [official FastFit](https://github.com/Zheng-Chong/FastFit), follow its dependency/GPU instructions, and copy `ai-space/outfit_api.py` alongside its `app.py`. The adapter has not been GPU-tested; resolve upstream dependency compatibility in that environment before exposing the service.
 2. Run with Gradio 5+ using `python outfit_api.py`. For a Hugging Face Gradio Space, set `app_file: outfit_api.py`. If using ZeroGPU, install `spaces`, select ZeroGPU hardware, and set `USE_ZEROGPU=1`. Validate the endpoint directly with all four reference inputs.
-3. Copy `.env.example` to `.env.local`, set `FASTFIT_URL` to the compatible service URL, and restart Next.js. The health check requires the named `try_on` endpoint.
+3. Copy `.env.example` to `.env.local`, set `FASTFIT_URL`, and restart Next.js.
 4. Test one complete outfit on each presentation. Check that shoes are visible, all pieces are respected, and provider quota failures return to the collage.
 
-[Hugging Face ZeroGPU](https://huggingface.co/docs/hub/spaces-zerogpu) currently documents free hosting for eligible accounts and a limited daily GPU allowance. Free availability, queuing, and compatibility must be verified for the actual deployment. FastFit has a noncommercial license; review it before expanding beyond personal use.
+On 2026-09-21 the official FastFit demo timed out, one public Hugging Face copy reported a runtime error, and another was sleeping on CPU hardware, so this route needs a deployment you control. FastFit has a noncommercial license; review it before expanding beyond personal use.
 
-Only the photos selected for an explicit Generate action, plus a bundled model reference, are sent to the connected service. Its upload/cache policy applies. The provided wrapper expires cached files after one hour. The site is a personal prototype: add authentication and a durable shared rate limiter before making the inference route publicly accessible. A serverless host must support the configured long-running requests. Do not assume the in-memory lock provides multi-instance protection.
+### Options that were ruled out
+
+- **Kolors-Virtual-Try-On** and similar purpose-built try-on Spaces: the most popular one serves `{"named_endpoints":{},"unnamed_endpoints":{}}`, meaning its API is switched off, and most of the remaining try-on Spaces sit in `RUNTIME_ERROR` or proxy a commercial backend. A general image-editing model turned out to handle the task better than the dedicated try-on Spaces that were still reachable.
+- **Spaces that force a style LoRA**: `prithivMLmods/Qwen-Image-Edit-2511-LoRAs-Fast` works anonymously and is a useful fallback, but it always applies one of its style LoRAs. Its default, `Photo-to-Anime`, wrecks a try-on result; `Ultra-Realistic-Portrait` produced the good image described above.
+- **Pollinations**: genuinely keyless, but the free tier is text-to-image only. Its `kontext` image-to-image mode requires inputs to be publicly fetchable URLs, which private wardrobe photos are not.
+- **Gemini image models** and **Hugging Face Inference Providers**: image generation has no Gemini free tier, and HF free accounts get $0.10 of monthly credit, which is a trial rather than a free route.
+
+Both routes share one HTTP client: Gradio's upload/call/SSE flow over native fetch, with request size limits, a timeout, same-origin result checks, a single in-flight request per Node process, and a quota cooldown. The automated adapter tests use a local simulated Gradio service; they cover the request and error handling, not generated-image quality or GPU compatibility.
+
+[Hugging Face ZeroGPU](https://huggingface.co/docs/hub/spaces-zerogpu) documents free hosting for eligible accounts and a limited daily GPU allowance. Expect queueing, and expect the daily allowance to run out.
+
+Only the photos selected for an explicit Generate action, plus a bundled model reference, are sent to the connected service. Its upload/cache policy applies: `ai-space/outfit_api.py` expires cached files after one hour, but a third-party Space is outside your control, so do not send wardrobe photos you would not hand to its operator. The site is a personal prototype: add authentication and a durable shared rate limiter before making the inference route publicly accessible. A serverless host must support the configured long-running requests. Do not assume the in-memory lock provides multi-instance protection.
 
 ## Checks
 
@@ -52,7 +75,7 @@ npm test
 npm run build
 ```
 
-The Node test suite covers outfit gating, stale selection recovery, background removal safeguards, fragmented SSE, quota retry timing, image upload/queue/retrieval, and rejection of cross-origin result URLs. `tests/fixtures/` contains synthetic, explicitly named test garments for browser checks; they are not preloaded into the product.
+The Node test suite covers outfit gating, stale selection recovery, background removal safeguards, fragmented SSE, quota retry timing, image upload/queue/retrieval, both provider payload shapes, and rejection of cross-origin result URLs. `tests/fixtures/` contains synthetic, explicitly named test garments for browser checks; they are not preloaded into the product.
 
 ## Model assets
 

@@ -1,33 +1,45 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { NextRequest, NextResponse } from "next/server";
-import { ProviderError, runFastFit } from "@/lib/fastfit";
+import { ProviderError, runFastFit, runQwenEdit } from "@/lib/providers";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
 export const dynamic = "force-dynamic";
+// A 4-step Space on purpose. ZeroGPU compares the *requested* GPU duration
+// against remaining quota, so Spaces asking for 180s are refused outright on a
+// free allowance while this one, asking for the 60s default, fits.
+const QWEN_SPACE = "https://linoyts-qwen-image-edit-2511-fast.hf.space";
 let running = false;
 let limitedUntil = 0;
 
-function baseUrl() {
-  const value = process.env.FASTFIT_URL?.trim();
-  if (!value) return null;
+function safeUrl(value: string | undefined) {
+  if (!value?.trim()) return null;
   try {
-    const url = new URL(value);
+    const url = new URL(value.trim());
     if (url.username || url.password || url.search || url.hash) return null;
     if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1"].includes(url.hostname))) return null;
     return url.href.replace(/\/$/, "");
   } catch { return null; }
 }
 
+// A self-hosted FastFit endpoint wins when present; otherwise use the shared
+// Qwen-Image-Edit Space. HF_TOKEN is optional there: without it the caller draws
+// on a small per-IP allowance that is often already spent.
+function provider() {
+  const fastfit = safeUrl(process.env.FASTFIT_URL);
+  if (fastfit) return { kind: "fastfit" as const, base: fastfit, endpoint: "try_on", token: undefined };
+  const base = safeUrl(process.env.IMAGE_EDIT_URL) ?? QWEN_SPACE;
+  return { kind: "qwen" as const, base, endpoint: "infer", token: process.env.HF_TOKEN?.trim() || undefined };
+}
+
 export async function GET() {
-  const base = baseUrl();
-  if (!base) return NextResponse.json({ available: false, reason: "not_configured" });
+  const active = provider();
   try {
-    const response = await fetch(`${base}/config`, { signal: AbortSignal.timeout(8000), cache: "no-store", redirect: "error" });
-    const config = await response.json();
-    const compatible = config.dependencies?.some((d: { api_name?: string }) => d.api_name === "try_on");
-    return NextResponse.json({ available: response.ok && !!compatible, reason: compatible ? "connected" : "unavailable" });
+    const response = await fetch(`${active.base}/gradio_api/info`, { signal: AbortSignal.timeout(8000), cache: "no-store", redirect: "error" });
+    const info = await response.json();
+    const compatible = !!info.named_endpoints?.[`/${active.endpoint}`];
+    return NextResponse.json({ available: response.ok && compatible, reason: compatible ? "connected" : "unavailable" });
   } catch { return NextResponse.json({ available: false, reason: "unavailable" }); }
 }
 
@@ -36,8 +48,7 @@ export async function POST(request: NextRequest) {
   // a public service without authentication and a shared rate limiter.
   const origin = request.headers.get("origin");
   if (!origin || origin !== request.nextUrl.origin) return NextResponse.json({ error: "Open Outfit Builder to generate an outfit." }, { status: 403 });
-  const base = baseUrl();
-  if (!base) return NextResponse.json({ error: "AI preview is not connected yet. Your collage is always available." }, { status: 503 });
+  const active = provider();
   if (running) return NextResponse.json({ error: "An outfit is already generating. Please wait for it to finish." }, { status: 409 });
   if (Date.now() < limitedUntil) return NextResponse.json({ error: "The free AI allowance is used up. Use your collage for now.", retryAfter: Math.ceil((limitedUntil - Date.now()) / 1000) }, { status: 429 });
   const maxBytes = 8 * 1024 * 1024;
@@ -74,7 +85,10 @@ export async function POST(request: NextRequest) {
     }
     const model = await readFile(path.join(process.cwd(), "public", "models", `${presentation}.png`));
     const signal = AbortSignal.any([request.signal, AbortSignal.timeout(270000)]);
-    const result = await runFastFit(base, [new Blob([model], { type: "image/png" }), ...images], signal);
+    const inputs = [new Blob([model], { type: "image/png" }), ...images];
+    const result = active.kind === "fastfit"
+      ? await runFastFit(active.base, inputs, signal)
+      : await runQwenEdit(active.base, inputs, active.token, signal);
     return new Response(result, { headers: { "content-type": result.type, "cache-control": "no-store" } });
   } catch (error) {
     if (error instanceof ProviderError) {
